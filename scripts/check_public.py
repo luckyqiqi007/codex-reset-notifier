@@ -9,6 +9,9 @@ PATTERNS = (
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     re.compile(r"webhook/send\?key=[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}\b"),
+    re.compile(r"access_token=[A-Za-z0-9]{32,}"),
+    re.compile(r"open\.feishu\.cn/open-apis/bot/v2/hook/[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}"),
+    re.compile(r"\bSEC[a-fA-F0-9]{32,}\b"),
 )
 
 

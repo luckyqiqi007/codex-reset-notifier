@@ -16,18 +16,25 @@ class Settings:
     poll_interval_seconds: int = 60
     delivery_enabled: bool = False
     state_dir: Path = Path("data")
+    notification_channels: tuple[str, ...] = ("wecom",)
     webhook_url: str = field(default="", repr=False)
     relay_url: str = field(default="", repr=False)
     relay_authorization: str = field(default="", repr=False)
     proxy_url: str = field(default="", repr=False)
+    dingtalk_webhook_url: str = field(default="", repr=False)
+    dingtalk_secret: str = field(default="", repr=False)
+    feishu_webhook_url: str = field(default="", repr=False)
+    feishu_secret: str = field(default="", repr=False)
 
 
 SCHEMA = {
     "service": {"delivery_enabled": bool, "poll_interval_seconds": int,
-                "state_dir": str, "secrets_dir": str},
+                "state_dir": str, "secrets_dir": str, "notification_channels": list},
     "telegram": {"channel": str, "relay_url": str, "relay_authorization": str,
                  "relay_authorization_file": str, "proxy_url": str, "proxy_url_file": str},
     "wecom": {"webhook_url": str, "webhook_url_file": str},
+    "dingtalk": {"webhook_url": str, "webhook_url_file": str, "secret": str, "secret_file": str},
+    "feishu": {"webhook_url": str, "webhook_url_file": str, "secret": str, "secret_file": str},
 }
 
 
@@ -116,13 +123,24 @@ def load_config(config_path=None, environ=None):
     channel = value("telegram", "channel", "TELEGRAM_CHANNEL", "codexreset")
     if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", channel):
         raise ConfigError("invalid_channel")
+    targets = value("service", "notification_channels", "NOTIFICATION_CHANNELS", ["wecom"])
+    if isinstance(targets, str):
+        targets = [target.strip() for target in targets.split(",")]
+    if (not targets or any(type(name) is not str or name not in ("wecom", "dingtalk", "feishu") for name in targets)
+            or len(set(targets)) != len(targets)):
+        raise ConfigError("invalid_notification_channels")
     return Settings(
         channel=channel,
         poll_interval_seconds=interval,
         delivery_enabled=enabled,
         state_dir=setting_path("state_dir", "STATE_DIR", "data"),
+        notification_channels=tuple(targets),
         webhook_url=secret("wecom", "webhook_url", "WECOM_WEBHOOK_URL", "wecom-webhook-url"),
         relay_url=value("telegram", "relay_url", "TELEGRAM_RELAY_URL", ""),
         relay_authorization=secret("telegram", "relay_authorization", "TELEGRAM_RELAY_AUTHORIZATION", "relay-authorization"),
         proxy_url=secret("telegram", "proxy_url", "TELEGRAM_PROXY_URL", "telegram-proxy-url"),
+        dingtalk_webhook_url=secret("dingtalk", "webhook_url", "DINGTALK_WEBHOOK_URL", "dingtalk-webhook-url"),
+        dingtalk_secret=secret("dingtalk", "secret", "DINGTALK_SECRET", "dingtalk-secret"),
+        feishu_webhook_url=secret("feishu", "webhook_url", "FEISHU_WEBHOOK_URL", "feishu-webhook-url"),
+        feishu_secret=secret("feishu", "secret", "FEISHU_SECRET", "feishu-secret"),
     )

@@ -23,7 +23,9 @@
 
    若使用 relay，在创建 Secret 时同时加 `--from-file=relay-authorization=secrets/relay-authorization`，并设置非敏感的 `telegram.relay_url`。不要把授权头写入 ConfigMap。
 
-3. 检查 `deploy/kubernetes/config.example.toml`，默认关闭发送。PVC 使用集群默认存储类；若无默认值，需设置可用 `storageClassName`。注意存储费用和 PV 回收策略。
+   仅使用钉钉/飞书时，将上述 `--from-file` 换成对应文件：`dingtalk-webhook-url`、`dingtalk-secret`（加签可选）、`feishu-webhook-url`、`feishu-secret`（加签可选）。可把多个渠道的键放在同一个 Secret 中。Webhook 与签名密钥都不能写入 ConfigMap。
+
+3. 检查 `deploy/kubernetes/config.example.toml`，默认关闭发送，`notification_channels` 默认 `["wecom"]`。按需选择钉钉、飞书或多个渠道；程序自动从 Secret 挂载目录读取对应文件。PVC 使用集群默认存储类；若无默认值，需设置可用 `storageClassName`。注意存储费用和 PV 回收策略。
 
    NetworkPolicy 允许 `kube-system` 中标记为 `k8s-app=kube-dns` 的 DNS，以及公网 IPv4 TCP/443，拒绝入站。依赖 CNI 实际执行策略；若使用 NodeLocal DNS、自定义 DNS、内网代理或非 443 端口，需精确补充规则，不能直接删除隔离策略。
 

@@ -3,6 +3,8 @@
 delivery_enabled = false
 poll_interval_seconds = 60 # 30–120 秒
 state_dir = "data"
+# 可同时启用多个渠道；每种渠道目前支持一个机器人。
+notification_channels = ["wecom"] # 可选："wecom", "dingtalk", "feishu"
 # secrets_dir = "/run/notifier-secrets"
 
 [telegram]
@@ -19,3 +21,16 @@ channel = "codexreset"
 webhook_url = ""
 # 或删除上面的 webhook_url 行，使用独立 Secret 文件：
 # webhook_url_file = "secrets/wecom-webhook-url"
+
+[dingtalk]
+webhook_url = ""
+secret = "" # 开启加签时填写；未开启时需按平台配置关键词或 IP 白名单。
+# 使用文件时删除相应的上方明文配置行：
+# webhook_url_file = "secrets/dingtalk-webhook-url"
+# secret_file = "secrets/dingtalk-secret"
+
+[feishu]
+webhook_url = ""
+secret = "" # 开启签名校验时填写。
+# webhook_url_file = "secrets/feishu-webhook-url"
+# secret_file = "secrets/feishu-secret"

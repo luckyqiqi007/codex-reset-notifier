@@ -158,6 +158,52 @@ webhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=PRIVATE_TEST
                 self.assertNotEqual(result.returncode, 0)
                 self.assertNotIn("PRIVATE", result.stdout + result.stderr)
 
+    def test_default_channels_preserve_wecom_compatibility(self):
+        cfg = self.load()
+        self.assertEqual(getattr(cfg, "notification_channels", None), ("wecom",))
+
+    def test_multiple_channels_and_signed_webhooks_are_configurable(self):
+        cfg = self.load('''[service]
+notification_channels = ["dingtalk", "feishu"]
+[dingtalk]
+webhook_url = "https://oapi.dingtalk.com/robot/send?access_token=TEST_ONLY"
+secret = "DING_SECRET_TEST"
+[feishu]
+webhook_url = "https://open.feishu.cn/open-apis/bot/v2/hook/TEST_ONLY"
+secret = "FEISHU_SECRET_TEST"
+''')
+        self.assertEqual(cfg.notification_channels, ("dingtalk", "feishu"))
+        self.assertEqual(cfg.dingtalk_secret, "DING_SECRET_TEST")
+        self.assertEqual(cfg.feishu_secret, "FEISHU_SECRET_TEST")
+        self.assertNotIn("SECRET_TEST", repr(cfg))
+
+    def test_notification_channels_environment_overrides_toml(self):
+        cfg = self.load('[service]\nnotification_channels = ["wecom"]', {"NOTIFICATION_CHANNELS": "feishu,dingtalk"})
+        self.assertEqual(cfg.notification_channels, ("feishu", "dingtalk"))
+
+    def test_duplicate_unknown_or_empty_destination_list_is_rejected(self):
+        from configuration import ConfigError
+        for selection in ('[]', '["wecom", "wecom"]', '["unknown"]', '[12]', '"wecom"'):
+            with self.subTest(selection=selection), self.assertRaises(ConfigError):
+                self.load('[service]\nnotification_channels = '+selection)
+
+    def test_new_provider_secret_files_and_environment_are_supported(self):
+        (self.root / "ding-secret").write_text("DING_FILE_ONLY")
+        cfg = self.load('[dingtalk]\nsecret_file = "ding-secret"',
+                        {"FEISHU_SECRET": "FEISHU_ENV_ONLY"})
+        self.assertEqual(cfg.dingtalk_secret, "DING_FILE_ONLY")
+        self.assertEqual(cfg.feishu_secret, "FEISHU_ENV_ONLY")
+
+    def test_feishu_only_enabled_does_not_require_wecom(self):
+        result = self.cli('''[service]
+delivery_enabled = true
+notification_channels = ["feishu"]
+[feishu]
+webhook_url = "https://open.feishu.cn/open-apis/bot/v2/hook/TEST_ONLY"
+''', "--check-config")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["notification_channels"], ["feishu"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,4 @@
-"""Public Telegram channel to WeCom. Python 3.12+, standard library only."""
+"""Public Telegram announcements to configurable notification channels. Python 3.12+."""
 import argparse
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -11,10 +11,12 @@ import signal
 import sqlite3
 import threading
 import time
-from urllib.parse import parse_qs, unquote, urlparse
-from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+from urllib.parse import urlparse
+from urllib.request import ProxyHandler, Request, build_opener
 
 from configuration import ConfigError, load_config
+from destinations import (PROVIDERS, DeliveryError, NoRedirect, check_ack, from_settings,
+                          validate_webhook, validated_url)
 
 LOG = logging.getLogger("codex-reset-notifier")
 STOP = threading.Event()
@@ -23,10 +25,6 @@ VOID_TAGS = {"br", "img", "hr", "input", "meta", "link", "source", "wbr"}
 
 
 class SourceError(Exception):
-    pass
-
-
-class DeliveryError(Exception):
     pass
 
 
@@ -129,7 +127,7 @@ def acceptance_payload(rows, channel, test_id):
     latest = max(row["id"] for row in rows)
     stamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
     content = (f"**Codex 通知服务｜验收测试**\n验收编号：{test_id}\n时间：{stamp}（北京时间）\n\n"
-               f"已成功读取 {len(rows)} 条公开频道消息，并验证企业微信投递链路。\n"
+               f"已成功读取 {len(rows)} 条公开频道消息，此消息用于验证所选通知渠道。\n"
                "这是部署验收通知，**不是新的额度重置公告**。\n\n"
                f"[查看最新频道原帖](https://t.me/{channel}/{latest})")
     return {"msgtype": "markdown", "markdown": {"content": content}}
@@ -220,44 +218,6 @@ class Store:
         return self.db.execute("SELECT 1 FROM posts WHERE state='dead' OR (state='pending' AND attempts>0) LIMIT 1").fetchone() is not None
 
 
-def validated_url(value, schemes=("https",)):
-    if re.search(r"[\x00-\x20\x7f]", unquote(value)):
-        raise ValueError("url_contains_whitespace_or_controls")
-    try:
-        parsed = urlparse(value)
-        if parsed.scheme not in schemes or not parsed.hostname:
-            raise ValueError("invalid_url")
-        if parsed.port is not None and not 1 <= parsed.port <= 65535:
-            raise ValueError("invalid_port")
-        return parsed
-    except ValueError:
-        raise ValueError("invalid_url") from None
-
-
-def validate_webhook(value):
-    parsed = validated_url(value)
-    if (parsed.scheme != "https" or parsed.netloc != "qyapi.weixin.qq.com"
-            or parsed.path != "/cgi-bin/webhook/send" or parsed.fragment
-            or not parse_qs(parsed.query).get("key")):
-        raise ValueError("invalid_wecom_webhook")
-    return value
-
-
-def check_ack(data):
-    try:
-        result = json.loads(data)
-    except (ValueError, UnicodeError):
-        raise DeliveryError("wecom_invalid_json") from None
-    code = result.get("errcode") if isinstance(result, dict) else None
-    if type(code) is not int or code != 0:
-        label = str(code) if type(code) is int else "missing"
-        raise DeliveryError("wecom_error_" + label)
-
-
-class NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise ValueError("redirect_refused")
-
 
 class Transport:
     def __init__(self, proxy="", webhook="", relay_url="", relay_authorization=""):
@@ -319,6 +279,50 @@ class Transport:
             raise DeliveryError("delivery_request_" + type(exc).__name__) from None
 
 
+def open_stores(state_dir, channel, targets):
+    stores = {}
+    try:
+        for name in targets:
+            if name not in PROVIDERS or name in stores:
+                raise ValueError("invalid_notification_channels")
+            filename = "state.db" if name == "wecom" else "state-" + name + ".db"
+            stores[name] = Store(Path(state_dir) / filename, channel)
+        return stores
+    except Exception:
+        for store in stores.values():
+            store.close()
+        raise
+
+
+def delivery_status(stores):
+    details = {name: dict(store.counts(), delivery_error=store.has_delivery_error())
+               for name, store in stores.items()}
+    totals = {key: sum(state[key] for state in details.values())
+              for key in ("sent", "pending", "dead", "ignored", "expired")}
+    return dict(totals, destinations=details,
+                delivery_error=any(state["delivery_error"] for state in details.values()))
+
+
+def deliver_pending(stores, destinations, clock=None, heartbeat=lambda: None,
+                    pause=lambda seconds: None, stopped=lambda: False):
+    clock = time.time if clock is None else clock
+    for name, destination in destinations.items():
+        store = stores[name]
+        for item in store.pending(clock()):
+            if stopped():
+                return
+            heartbeat()
+            try:
+                destination.send(item["payload"])
+                store.delivered(item["id"], item["hash"])
+                LOG.info("delivery_ok destination=%s message_id=%d", name, item["id"])
+            except DeliveryError as exc:
+                store.failed(item["id"], clock())
+                LOG.warning("delivery_failed destination=%s message_id=%d reason=%s", name, item["id"], exc)
+            heartbeat()
+            pause(3.5)
+
+
 def fetch_since(transport, channel, cursor, now=None):
     rows = transport.fetch(channel)
     if cursor is None:
@@ -338,6 +342,34 @@ def fetch_since(transport, channel, cursor, now=None):
     return rows
 
 
+def fetch_observations(transport, channel, stores, now=None):
+    # One in-memory page cache per poll; lagging channels cannot veto peers.
+    class CachedPages:
+        def __init__(self):
+            self.pages = {}
+            self.errors = {}
+
+        def fetch(self, channel, before=None):
+            if before in self.errors:
+                raise SourceError(self.errors[before])
+            if before not in self.pages:
+                try:
+                    self.pages[before] = transport.fetch(channel, before)
+                except SourceError as exc:
+                    self.errors[before] = str(exc)
+                    raise
+            return self.pages[before]
+
+    cache = CachedPages()
+    observations, errors = {}, {}
+    for name, store in stores.items():
+        try:
+            observations[name] = fetch_since(cache, channel, store.cursor(), now=now)
+        except SourceError as exc:
+            errors[name] = str(exc)
+    return observations, errors
+
+
 def write_health(path, status):
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(status))
@@ -350,7 +382,8 @@ def health_check(path, kind):
         now = time.time()
         alive = now - status.get("heartbeat", 0) < 300
         ready = (alive and now - status.get("source_success", 0) < 600
-                 and status.get("dead", 0) == 0 and not status.get("delivery_error", False))
+                 and status.get("dead", 0) == 0 and not status.get("delivery_error", False)
+                 and not status.get("source_errors"))
         return 0 if (alive if kind == "live" else ready) else 1
     except (OSError, ValueError):
         return 1
@@ -364,9 +397,12 @@ def main():
     mode.add_argument("--dry-run", action="store_true", help="read public source once; never send or mutate delivery state")
     mode.add_argument("--health-check", choices=("live", "ready"))
     mode.add_argument("--send-test", metavar="TEST_ID", help="explicitly send one labelled acceptance notice after a real source fetch")
+    parser.add_argument("--destination", choices=PROVIDERS, help="with --send-test, send only to this configured channel")
     args = parser.parse_args()
     if args.send_test and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", args.send_test):
         parser.error("--send-test requires a simple test ID")
+    if args.destination and not args.send_test:
+        parser.error("--destination requires --send-test")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = load_config(args.config)
     state_dir = cfg.state_dir
@@ -376,66 +412,84 @@ def main():
     channel = cfg.channel
     enabled = cfg.delivery_enabled and not args.dry_run
     interval = cfg.poll_interval_seconds
-    if (enabled or args.send_test) and not cfg.webhook_url:
-        raise ConfigError("webhook_missing")
     try:
-        transport = Transport(cfg.proxy_url, cfg.webhook_url, cfg.relay_url, cfg.relay_authorization)
+        transport = Transport(cfg.proxy_url, "", cfg.relay_url, cfg.relay_authorization)
         transport.make_source_request(channel)  # Validate relay channel before any network access.
+        destinations = from_settings(cfg)
     except ValueError:
         raise ConfigError("invalid_transport_configuration") from None
+    if args.destination:
+        if args.destination not in destinations:
+            raise ConfigError("test_destination_not_selected")
+        destinations = {args.destination: destinations[args.destination]}
+    if enabled or args.send_test:
+        for name, destination in destinations.items():
+            if not destination.configured:
+                raise ConfigError("webhook_missing" if name == "wecom" else name + "_credential_missing")
     if args.check_config:
         print(json.dumps({"config_ok": True, "channel": channel, "poll_interval_seconds": interval,
                           "delivery_enabled": cfg.delivery_enabled, "webhook_configured": bool(cfg.webhook_url),
-                          "relay_configured": bool(cfg.relay_url), "proxy_configured": bool(cfg.proxy_url)}))
+                          "relay_configured": bool(cfg.relay_url), "proxy_configured": bool(cfg.proxy_url),
+                          "notification_channels": list(destinations),
+                          "destinations": {name: {"configured": d.configured, "signing_enabled": d.signing_enabled}
+                                           for name, d in destinations.items()}}))
         return 0
     if args.send_test:
         rows = transport.fetch(channel)
-        transport.send(json.dumps(acceptance_payload(rows, channel, args.send_test), ensure_ascii=False))
-        print(json.dumps({"test_message_accepted": True, "test_id": args.send_test, "source_messages": len(rows)}))
-        return 0
+        payload = json.dumps(acceptance_payload(rows, channel, args.send_test), ensure_ascii=False)
+        results = {}
+        for name, destination in destinations.items():
+            try:
+                destination.send(payload)
+                results[name] = True
+            except DeliveryError as exc:
+                LOG.warning("test_delivery_failed destination=%s reason=%s", name, exc)
+                results[name] = False
+        accepted = all(results.values())
+        print(json.dumps({"test_message_accepted": accepted, "test_id": args.send_test,
+                          "source_messages": len(rows), "destination_results": results}))
+        return 0 if accepted else 1
     if args.dry_run:
         rows = transport.fetch(channel)
         print(json.dumps({"source_ok": True, "messages": len(rows), "latest_id": max(r["id"] for r in rows),
                           "matching_messages": sum(bool(KEYWORDS.search(r["text"])) for r in rows), "delivery_enabled": False}))
         return 0
     state_dir.mkdir(parents=True, exist_ok=True)
-    store = Store(state_dir / "state.db", channel)
+    stores = open_stores(state_dir, channel, cfg.notification_channels)
     status = {"heartbeat": time.time(), "source_success": 0, "delivery_enabled": enabled, "delivery_error": False}
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: STOP.set())
-    LOG.info("started channel=%s delivery_enabled=%s relay_enabled=%s", channel, enabled, bool(transport.relay_url))
+    LOG.info("started channel=%s delivery_enabled=%s relay_enabled=%s destinations=%s",
+             channel, enabled, bool(transport.relay_url), ",".join(destinations))
+
+    def heartbeat():
+        status.update(delivery_status(stores), heartbeat=time.time())
+        write_health(health_path, status)
+
     try:
         while not STOP.is_set():
-            status["heartbeat"] = time.time()
-            write_health(health_path, status)
-            try:
-                rows = fetch_since(transport, channel, store.cursor())
-                store.observe(rows, time.time(), enabled)
-                status["source_success"] = time.time()
-                LOG.info("source_ok messages=%d latest_id=%d", len(rows), store.cursor())
-            except SourceError as exc:
-                LOG.warning("%s", exc)
+            heartbeat()
+            observations, errors = fetch_observations(transport, channel, stores)
+            for name, rows in observations.items():
+                store = stores[name]
+                try:
+                    store.observe(rows, time.time(), enabled)
+                    status["source_success"] = time.time()
+                    LOG.info("source_ok destination=%s messages=%d latest_id=%d", name, len(rows), store.cursor())
+                except SourceError as exc:
+                    errors[name] = str(exc)
+            status["source_errors"] = errors
+            for name, error in errors.items():
+                LOG.warning("source_failed destination=%s reason=%s", name, error)
             if enabled:
-                for item in store.pending(time.time()):
-                    if STOP.is_set():
-                        break
-                    try:
-                        transport.send(item["payload"])
-                        store.delivered(item["id"], item["hash"])
-                        status["delivery_error"] = False
-                        LOG.info("delivery_ok message_id=%d", item["id"])
-                    except DeliveryError as exc:
-                        store.failed(item["id"], time.time())
-                        status["delivery_error"] = True
-                        LOG.warning("delivery_failed message_id=%d reason=%s", item["id"], exc)
-                    STOP.wait(3.5)
-            store.expire(time.time())
-            status.update(store.counts(), heartbeat=time.time())
-            status["delivery_error"] = store.has_delivery_error()
-            write_health(health_path, status)
+                deliver_pending(stores, destinations, heartbeat=heartbeat, pause=STOP.wait, stopped=STOP.is_set)
+            for store in stores.values():
+                store.expire(time.time())
+            heartbeat()
             STOP.wait(interval)
     finally:
-        store.close()
+        for store in stores.values():
+            store.close()
     return 0
 
 

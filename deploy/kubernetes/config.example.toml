@@ -2,6 +2,7 @@
 delivery_enabled = false
 poll_interval_seconds = 60
 state_dir = "/data"
+notification_channels = ["wecom"]
 
 [telegram]
 channel = "codexreset"
@@ -9,4 +10,11 @@ channel = "codexreset"
 # relay_url = "https://relay.example.com/codex-reset-feed"
 
 [wecom]
-webhook_url_file = "/run/notifier-secrets/wecom-webhook-url"
+# Credentials are discovered in /run/notifier-secrets by their documented names.
+# Only selected channels require credentials when delivery is enabled.
+
+[dingtalk]
+# dingtalk-webhook-url, dingtalk-secret (optional signing key)
+
+[feishu]
+# feishu-webhook-url, feishu-secret (optional signing key)
