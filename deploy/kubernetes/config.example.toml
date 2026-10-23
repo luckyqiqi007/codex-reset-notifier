@@ -1,0 +1,12 @@
+[service]
+delivery_enabled = false
+poll_interval_seconds = 60
+state_dir = "/data"
+
+[telegram]
+channel = "codexreset"
+# Optional relay; keep authorization in the mounted Secret, never ConfigMap.
+# relay_url = "https://relay.example.com/codex-reset-feed"
+
+[wecom]
+webhook_url_file = "/run/notifier-secrets/wecom-webhook-url"

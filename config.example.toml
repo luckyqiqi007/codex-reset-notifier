@@ -1,0 +1,21 @@
+[service]
+# 首次成功抓取只建立基线；确认配置后改为 true。
+delivery_enabled = false
+poll_interval_seconds = 60 # 30–120 秒
+state_dir = "data"
+# secrets_dir = "/run/notifier-secrets"
+
+[telegram]
+channel = "codexreset"
+
+# 三种路径任选一种：直连（默认）、HTTP CONNECT 代理、固定频道 HTTPS relay。
+# proxy_url = "http://127.0.0.1:7890"
+# proxy_url_file = "secrets/telegram-proxy-url"
+# relay_url = "https://relay.example.com/codex-reset-feed"
+# relay_authorization_file = "secrets/relay-authorization"
+
+[wecom]
+# 在本地 config.toml 填写机器人地址；不要提交真实配置。
+webhook_url = ""
+# 或删除上面的 webhook_url 行，使用独立 Secret 文件：
+# webhook_url_file = "secrets/wecom-webhook-url"

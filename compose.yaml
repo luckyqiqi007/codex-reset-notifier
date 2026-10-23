@@ -1,0 +1,24 @@
+version: "3.8"
+services:
+  notifier:
+    build: .
+    image: codex-reset-notifier:0.1.0
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+    - no-new-privileges:true
+    cap_drop:
+    - ALL
+    group_add:
+    - "${CONFIG_GID:-10001}"
+    environment:
+      NOTIFIER_CONFIG: /config/config.toml
+      STATE_DIR: /data
+    volumes:
+    - ./config.toml:/config/config.toml:ro
+    - notifier-data:/data
+    stop_grace_period: 45s
+    mem_limit: 128m
+    cpus: 0.20
+volumes:
+  notifier-data: {}

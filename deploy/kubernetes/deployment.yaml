@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codex-reset-notifier
+  annotations:
+    ignore-check.kube-linter.io/minimum-three-replicas: "SQLite queue requires a single writer."
+    ignore-check.kube-linter.io/no-rolling-update-strategy: "Recreate avoids overlapping delivery processes."
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: codex-reset-notifier
+  template:
+    metadata:
+      labels:
+        app: codex-reset-notifier
+    spec:
+      serviceAccountName: codex-reset-notifier
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: notifier
+        # Build and push your own image; this is deliberately a placeholder.
+        image: ghcr.io/your-user/codex-reset-notifier:0.1.0
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: NOTIFIER_CONFIG
+          value: /config/config.toml
+        - name: STATE_DIR
+          value: /data
+        resources:
+          requests:
+            cpu: 20m
+            memory: 48Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        readinessProbe:
+          exec:
+            command: [python, /app/notifier.py, --health-check, ready]
+          initialDelaySeconds: 15
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          exec:
+            command: [python, /app/notifier.py, --health-check, live]
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        volumeMounts:
+        - name: config
+          mountPath: /config
+          readOnly: true
+        - name: data
+          mountPath: /data
+        - name: credentials
+          mountPath: /run/notifier-secrets
+          readOnly: true
+      volumes:
+      - name: config
+        configMap:
+          name: codex-reset-notifier-config
+      - name: data
+        persistentVolumeClaim:
+          claimName: codex-reset-notifier-state
+      - name: credentials
+        secret:
+          secretName: codex-reset-notifier-secrets
+          defaultMode: 0440
