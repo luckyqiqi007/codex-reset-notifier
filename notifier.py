@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 from urllib.request import ProxyHandler, Request, build_opener
 
 from configuration import ConfigError, load_config
+from message_content import (STATUS_LABELS, classify_status, clean_body, fingerprint,
+                             normalized_links, previous_row, raw_fingerprint)
 from destinations import (PROVIDERS, DeliveryError, NoRedirect, check_ack, from_settings,
                           validate_webhook, validated_url)
 
@@ -105,18 +107,24 @@ def message_time(row):
         raise SourceError("invalid_message_timestamp") from None
 
 
-def make_payload(row, channel, updated=False):
-    stamp = message_time(row).astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
-    title = "内容更新" if updated else "频道转发"
-    head = f"**Codex 额度通知｜{title}**\n原帖发布时间：{stamp}（北京时间）\n\n"
+def make_payload(row, channel, updated=False, observed_at=None):
+    zone = timezone(timedelta(hours=8))
+    stamp = message_time(row).astimezone(zone).strftime("%Y-%m-%d %H:%M:%S")
+    observed = (datetime.fromtimestamp(observed_at, zone).strftime("%Y-%m-%d %H:%M:%S")
+                if observed_at is not None else "未记录")
+    status = STATUS_LABELS[classify_status(row["text"])]
+    update = "（内容更新）" if updated else ""
+    head = (f"**Codex 额度通知｜{status}{update}**\n"
+            f"频道发布时间：{stamp}（北京时间）\n"
+            f"本次发现时间：{observed}（北京时间）\n\n")
     tail = f"\n\n[频道原帖](https://t.me/{channel}/{row['id']})"
-    for index, url in enumerate(row["links"][:3], 1):
+    for index, url in enumerate(normalized_links(row["links"], channel)[:3], 1):
         safe_url = url.replace("(", "%28").replace(")", "%29").replace("\n", "").replace("\r", "")
         link = f" · [来源{index}]({safe_url})"
         if len((tail + link).encode("utf-8")) <= 1500:
             tail += link
     tail += "\n频道消息转发，未独立核验账号到账。"
-    body = row["text"].replace("<", "＜").replace(">", "＞")
+    body = clean_body(row["text"]).replace("<", "＜").replace(">", "＞")
     budget = 4000 - len((head + tail).encode("utf-8"))
     if len(body.encode("utf-8")) > budget:
         body = body.encode("utf-8")[:max(0, budget - 30)].decode("utf-8", "ignore") + "\n…详见原帖"
@@ -151,7 +159,13 @@ class Store:
         """)
         old_channel = self.db.execute("SELECT value FROM meta WHERE key='channel'").fetchone()
         if old_channel and old_channel[0] != channel:
+            self.db.close()
             raise ValueError("state_channel_mismatch")
+        columns = {item[1] for item in self.db.execute("PRAGMA table_info(posts)")}
+        with self.db:
+            for name in ("semantic_hash", "row_snapshot"):
+                if name not in columns:
+                    self.db.execute(f"ALTER TABLE posts ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
 
     def close(self):
         self.db.close()
@@ -170,19 +184,33 @@ class Store:
         with self.db:
             for row in rows:
                 published = message_time(row).timestamp()
-                digest = hashlib.sha256(json.dumps(row, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-                old = self.db.execute("SELECT hash, state, ever_sent FROM posts WHERE id=?", (row["id"],)).fetchone()
-                if old and old["hash"] == digest:
-                    continue
+                digest = raw_fingerprint(row)
+                meaning = fingerprint(row, self.channel)
+                snapshot = json.dumps(row, ensure_ascii=False, sort_keys=True)
+                old = self.db.execute("SELECT * FROM posts WHERE id=?", (row["id"],)).fetchone()
+                if old:
+                    prior = previous_row(old)
+                    same_raw = old["hash"] == digest
+                    same_meaning = prior is not None and fingerprint(prior, self.channel) == meaning
+                    if same_raw or same_meaning:
+                        # Observe formatting changes without changing delivery state,
+                        # payload, retries, or a previously sent message's identity.
+                        if old["row_snapshot"] != snapshot or old["semantic_hash"] != meaning or not same_raw:
+                            self.db.execute("UPDATE posts SET hash=?,semantic_hash=?,row_snapshot=? WHERE id=?",
+                                            (digest, meaning, snapshot, row["id"]))
+                        if not same_raw:
+                            LOG.info("source_edit_suppressed message_id=%d reason=non_material", row["id"])
+                        continue
                 eligible = (cursor is not None and enabled and 0 <= now - published <= self.max_age
                             and (KEYWORDS.search(row["text"]) is not None or (old is not None and old["ever_sent"]))
                             and (old is not None or row["id"] > cursor))
-                payload = json.dumps(make_payload(row, self.channel, updated=old is not None), ensure_ascii=False)
+                payload = json.dumps(make_payload(row, self.channel, updated=old is not None, observed_at=now), ensure_ascii=False)
                 state = "pending" if eligible else "ignored"
-                self.db.execute("""INSERT INTO posts(id,hash,payload,state,published) VALUES(?,?,?,?,?)
+                self.db.execute("""INSERT INTO posts(id,hash,payload,state,published,semantic_hash,row_snapshot) VALUES(?,?,?,?,?,?,?)
                     ON CONFLICT(id) DO UPDATE SET hash=excluded.hash,payload=excluded.payload,
-                    state=excluded.state,published=excluded.published,attempts=0,next_retry=0""",
-                                (row["id"], digest, payload, state, published))
+                    state=excluded.state,published=excluded.published,semantic_hash=excluded.semantic_hash,
+                    row_snapshot=excluded.row_snapshot,attempts=0,next_retry=0""",
+                                (row["id"], digest, payload, state, published, meaning, snapshot))
             self.db.execute("INSERT OR REPLACE INTO meta VALUES('cursor',?)", (str(latest),))
             self.db.execute("INSERT OR REPLACE INTO meta VALUES('channel',?)", (self.channel,))
 

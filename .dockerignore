@@ -2,5 +2,6 @@
 !notifier.py
 !configuration.py
 !destinations.py
+!message_content.py
 !Dockerfile
 !.dockerignore
