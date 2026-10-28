@@ -14,6 +14,7 @@ services:
     environment:
       NOTIFIER_CONFIG: /config/config.toml
       STATE_DIR: /data
+      CODEX_RESETS_ENABLED: "${CODEX_RESETS_ENABLED:-false}"
     volumes:
     - ./config.toml:/config/config.toml:ro
     - notifier-data:/data

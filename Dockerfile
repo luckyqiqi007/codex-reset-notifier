@@ -11,7 +11,7 @@ RUN groupadd --gid 10001 notifier \
     && chown notifier:notifier /data
 
 # Explicit source allowlist: no config, credentials, database, or Git history.
-COPY --chown=10001:10001 notifier.py configuration.py destinations.py message_content.py /app/
+COPY --chown=10001:10001 notifier.py configuration.py destinations.py message_content.py codex_resets.py /app/
 USER 10001:10001
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \

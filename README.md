@@ -24,6 +24,16 @@ Telegram 公开频道 ──直连 / HTTP CONNECT 代理 / 固定 HTTPS relay─
 - 保留原文、时间和来源链接；不执行频道文字中的指令。
 - 无入站端口。健康检查和日志用于检查采集与投递情况。
 
+## 可选补充来源
+
+支持 Codex Resets 免费公开 API；设置 `CODEX_RESETS_ENABLED=true` 开启，默认关闭。仅通知明确预告和网站完成记录，不推送 AI 概率预测。首次接入只建基线，同一 X 帖同阶段跨来源去重，预告变完成及实质编辑仍提醒。详见 [来源评估和接入说明](docs/sources.md)。Docker Compose 启用方式：
+
+```sh
+CODEX_RESETS_ENABLED=true docker compose up -d
+```
+
+网站无需 API Key，不调用付费 X API。需要运行环境能直连 `https://codex-resets.com/api/v1/status`。
+
 ## 本地快速开始
 
 需要 Python 3.12 或更新版本，以及能访问 `t.me` 和所选通知平台 API 的运行环境。下面以企业微信为例；钉钉、飞书及多渠道配置见 [渠道接入说明](docs/channels.md)。
@@ -63,7 +73,7 @@ python3 notifier.py --config config.toml
 
 ## 配置与密钥
 
-Webhook **不写入源码或镜像**。`config.example.toml` 是可提交模板，`config.toml` 是被 Git 忽略的本地文件。镜像仅复制四个 Python 源码文件；`.dockerignore` 采用白名单，配置、数据库和 `.git` 不进入构建上下文。
+Webhook **不写入源码或镜像**。`config.example.toml` 是可提交模板，`config.toml` 是被 Git 忽略的本地文件。镜像仅复制五个 Python 源码文件；`.dockerignore` 采用白名单，配置、数据库和 `.git` 不进入构建上下文。
 
 也可以让配置引用独立 Secret 文件。删除 `webhook_url` 行后，改成：
 

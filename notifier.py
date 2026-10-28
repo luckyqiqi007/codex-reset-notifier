@@ -5,6 +5,8 @@ import hashlib
 from html.parser import HTMLParser
 import json
 import logging
+import os
+import codex_resets
 from pathlib import Path
 import re
 import signal
@@ -166,6 +168,11 @@ class Store:
             for name in ("semantic_hash", "row_snapshot"):
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE posts ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+            if 'source_update' not in columns:
+                self.db.execute('ALTER TABLE posts ADD COLUMN source_update INTEGER NOT NULL DEFAULT 0')
+            codex_resets.init_ledger(self.db)
+            for item in self.db.execute("SELECT * FROM posts WHERE state='sent'"):
+                codex_resets.record_receipts(self.db, codex_resets.telegram_keys(previous_row(dict(item)) or {}), "telegram")
 
     def close(self):
         self.db.close()
@@ -206,11 +213,12 @@ class Store:
                             and (old is not None or row["id"] > cursor))
                 payload = json.dumps(make_payload(row, self.channel, updated=old is not None, observed_at=now), ensure_ascii=False)
                 state = "pending" if eligible else "ignored"
+                same_stage_update = old is not None and (prior is None or classify_status(prior['text']) == classify_status(row['text']))
                 self.db.execute("""INSERT INTO posts(id,hash,payload,state,published,semantic_hash,row_snapshot) VALUES(?,?,?,?,?,?,?)
                     ON CONFLICT(id) DO UPDATE SET hash=excluded.hash,payload=excluded.payload,
                     state=excluded.state,published=excluded.published,semantic_hash=excluded.semantic_hash,
-                    row_snapshot=excluded.row_snapshot,attempts=0,next_retry=0""",
-                                (row["id"], digest, payload, state, published, meaning, snapshot))
+                    row_snapshot=excluded.row_snapshot,attempts=0,next_retry=0,source_update=?""",
+                                (row["id"], digest, payload, state, published, meaning, snapshot, int(same_stage_update)))
             self.db.execute("INSERT OR REPLACE INTO meta VALUES('cursor',?)", (str(latest),))
             self.db.execute("INSERT OR REPLACE INTO meta VALUES('channel',?)", (self.channel,))
 
@@ -221,12 +229,22 @@ class Store:
 
     def pending(self, now):
         self.expire(now)
-        return [dict(row) for row in self.db.execute(
-            "SELECT * FROM posts WHERE state='pending' AND next_retry<=? ORDER BY id LIMIT 5", (now,))]
+        result = []
+        with self.db:
+            for row in self.db.execute("SELECT * FROM posts WHERE state='pending' AND next_retry<=? ORDER BY id LIMIT 5", (now,)).fetchall():
+                keys = codex_resets.telegram_keys(previous_row(dict(row)) or {})
+                if not row['source_update'] and codex_resets.seen_elsewhere(self.db, keys, 'telegram'):
+                    self.db.execute("UPDATE posts SET state='deduped',ever_sent=1 WHERE id=?", (row['id'],))
+                else:
+                    result.append(dict(row))
+        return result
 
     def delivered(self, msg_id, digest):
         with self.db:
             self.db.execute("UPDATE posts SET state='sent',ever_sent=1 WHERE id=? AND hash=?", (msg_id, digest))
+            row = self.db.execute("SELECT * FROM posts WHERE id=? AND hash=?", (msg_id, digest)).fetchone()
+            if row:
+                codex_resets.record_receipts(self.db, codex_resets.telegram_keys(previous_row(dict(row)) or {}), 'telegram')
 
     def failed(self, msg_id, now, max_attempts=8):
         row = self.db.execute("SELECT attempts FROM posts WHERE id=?", (msg_id,)).fetchone()
@@ -411,7 +429,7 @@ def health_check(path, kind):
         alive = now - status.get("heartbeat", 0) < 300
         ready = (alive and now - status.get("source_success", 0) < 600
                  and status.get("dead", 0) == 0 and not status.get("delivery_error", False)
-                 and not status.get("source_errors"))
+                 and not status.get("source_errors") and not status.get("codex_resets_error"))
         return 0 if (alive if kind == "live" else ready) else 1
     except (OSError, ValueError):
         return 1
@@ -440,6 +458,7 @@ def main():
     channel = cfg.channel
     enabled = cfg.delivery_enabled and not args.dry_run
     interval = cfg.poll_interval_seconds
+    website_enabled = codex_resets.enabled_from_env(os.environ)
     try:
         transport = Transport(cfg.proxy_url, "", cfg.relay_url, cfg.relay_authorization)
         transport.make_source_request(channel)  # Validate relay channel before any network access.
@@ -458,7 +477,7 @@ def main():
         print(json.dumps({"config_ok": True, "channel": channel, "poll_interval_seconds": interval,
                           "delivery_enabled": cfg.delivery_enabled, "webhook_configured": bool(cfg.webhook_url),
                           "relay_configured": bool(cfg.relay_url), "proxy_configured": bool(cfg.proxy_url),
-                          "notification_channels": list(destinations),
+                          "notification_channels": list(destinations), "codex_resets_enabled": website_enabled,
                           "destinations": {name: {"configured": d.configured, "signing_enabled": d.signing_enabled}
                                            for name, d in destinations.items()}}))
         return 0
@@ -479,11 +498,16 @@ def main():
         return 0 if accepted else 1
     if args.dry_run:
         rows = transport.fetch(channel)
+        extra = {}
+        if website_enabled:
+            events = codex_resets.fetch_status()
+            extra = {"codex_resets_ok": True, "codex_resets_events": len(events)}
         print(json.dumps({"source_ok": True, "messages": len(rows), "latest_id": max(r["id"] for r in rows),
-                          "matching_messages": sum(bool(KEYWORDS.search(r["text"])) for r in rows), "delivery_enabled": False}))
+                          "matching_messages": sum(bool(KEYWORDS.search(r["text"])) for r in rows), "delivery_enabled": False, **extra}))
         return 0
     state_dir.mkdir(parents=True, exist_ok=True)
     stores = open_stores(state_dir, channel, cfg.notification_channels)
+    websites = {name: codex_resets.Supplement(store.db) for name, store in stores.items()} if website_enabled else {}
     status = {"heartbeat": time.time(), "source_success": 0, "delivery_enabled": enabled, "delivery_error": False}
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: STOP.set())
@@ -492,6 +516,7 @@ def main():
 
     def heartbeat():
         status.update(delivery_status(stores), heartbeat=time.time())
+        status["delivery_error"] |= any(site.has_error() for site in websites.values())
         write_health(health_path, status)
 
     try:
@@ -506,11 +531,22 @@ def main():
                     LOG.info("source_ok destination=%s messages=%d latest_id=%d", name, len(rows), store.cursor())
                 except SourceError as exc:
                     errors[name] = str(exc)
+            if websites:
+                status["codex_resets_error"] = codex_resets.poll(websites.values(), time.time(), enabled)
+                if status["codex_resets_error"]:
+                    LOG.warning("codex_resets_failed reason=%s", status["codex_resets_error"])
+                else:
+                    LOG.info("codex_resets_ok")
             status["source_errors"] = errors
             for name, error in errors.items():
                 LOG.warning("source_failed destination=%s reason=%s", name, error)
             if enabled:
                 deliver_pending(stores, destinations, heartbeat=heartbeat, pause=STOP.wait, stopped=STOP.is_set)
+                for name, site in websites.items():
+                    counts = codex_resets.deliver(site, destinations[name].send, time.time(), STOP.wait, STOP.is_set)
+                    if counts["sent"] or counts["failed"]:
+                        LOG.info("codex_resets_delivery destination=%s sent=%d failed=%d", name, counts["sent"], counts["failed"])
+                    heartbeat()
             for store in stores.values():
                 store.expire(time.time())
             heartbeat()
