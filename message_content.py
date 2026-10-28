@@ -22,11 +22,12 @@ NEGATED = re.compile(r"(?:尚未|还未|没有|并未|未曾|暂未|未能|不�
 CONDITIONAL = re.compile(r"如果|假如|若(?:已|未)|\b(?:if|unless|assuming|once)\b", re.I)
 FUTURE = re.compile(r"预计|将于|将会|即将|明天|明日|又要重置|具体时间|\b(?:will|would|should|tomorrow|planned|scheduled|landing)\b", re.I)
 COMPLETE = re.compile(r"(?:已|已经)(?:为所有人|全员|全部|完成|提前|陆续|\s)*重置|"
-                      r"重置(?:已经|已)(?:完成|生效)|(?:配额|额度).{0,10}(?:已经|已)(?:生效|刷新)|"
+                      r"重置(?:已经|已)(?:陆续|逐步|全部|全量)?(?:完成|生效)|(?:配额|额度).{0,10}(?:已经|已)(?:生效|刷新)|"
                       r"\b(?:has|have)\s+(?:now\s+|already\s+)?(?:been\s+)?reset\b|"
                       r"\b(?:reset|resets?)\s+(?:is\s+|has\s+been\s+)?(?:now\s+)?complete(?:d)?\b|"
                       r"\b(?:fresh\s+)?quotas?\s+(?:are|is)\s+(?:now\s+)?live\b|"
-                      r"\b(?:all|fully)\s+(?:is\s+|has\s+|been\s+)*propagated\b", re.I)
+                      r"\b(?:all|fully)\s+(?:is\s+|has\s+|been\s+)*propagated\b|"
+                      r"\b(?:limit|quota)\s+reset\s*:\s*(?:finished|completed|done)\s*$", re.I)
 
 
 def classify_status(text):

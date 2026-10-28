@@ -193,4 +193,29 @@ class EventDeliveryTests(unittest.TestCase):
         self.store.observe([tg(TG_TEXT+'\n额度已经重置。Fresh quotas are now live.')],NOW,True)
         self.assertEqual(len(self.store.pending(NOW)),1)
 
+    def test_future_gradual_completion_sends_once_after_announcement(self):
+        self.site.observe(website(),NOW,True);cr.deliver(self.site,lambda _:None,NOW)
+        self.store.observe([tg()],NOW,True);self.store.pending(NOW)
+        text=TG_TEXT.replace('（预计北京时间下午约 15:00 前）','（14:30重置已陆续完成）').replace(
+            'Quotas will refresh today by midnight PST (~07:00 UTC)','Finished')
+        self.store.observe([tg(text)],NOW,True)
+        out=[];result=cr.deliver_events(self.store,self.site,out.append,clock=lambda:NOW)
+        self.assertEqual(result['telegram']['sent'],1)
+        self.assertIn('来源称已完成',out[0])
+        self.store.observe([tg(text)],NOW,True)
+        self.assertEqual(sum(v['sent'] for v in cr.deliver_events(self.store,self.site,out.append,clock=lambda:NOW).values()),0)
+
+    def test_explicit_skip_does_not_forge_receipt_or_mute_next_event(self):
+        self.store.observe([tg()],NOW,True)
+        item=self.store.pending(NOW)[0];self.store.delivered(item['id'],item['hash'])
+        event_id=self.store.db.execute("SELECT event_id FROM reset_event_messages WHERE origin='telegram' AND ident='67'").fetchone()[0]
+        with self.store.db:self.store.events.suppress(event_id,'reported_complete','user_skip_day23',NOW)
+        self.store.observe([tg(TG_TEXT+'\n重置已陆续完成。')],NOW,True)
+        self.assertEqual(self.store.pending(NOW),[])
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM reset_event_receipts WHERE event_id=? AND stage='reported_complete'",(event_id,)).fetchone()[0],0)
+        next_post=tg('Day 24 额度已经重置。',ident=68)
+        next_post['links']=['https://x.com/thsottiaux/status/999900000000']
+        self.store.observe([next_post],NOW,True)
+        self.assertEqual(len(self.store.pending(NOW)),1)
+
 if __name__=='__main__':unittest.main()

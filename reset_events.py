@@ -140,6 +140,9 @@ class EventLedger:
                 event_id INTEGER NOT NULL, origin TEXT NOT NULL, ident TEXT NOT NULL,
                 revision INTEGER NOT NULL, old_plan REAL NOT NULL, new_plan REAL NOT NULL,
                 PRIMARY KEY(origin,ident,revision))''',
+            '''CREATE TABLE IF NOT EXISTS reset_event_suppressions (
+                event_id INTEGER NOT NULL,stage TEXT NOT NULL,reason TEXT NOT NULL,
+                created_at REAL NOT NULL,PRIMARY KEY(event_id,stage))''',
         ):
             db.execute(statement)
         if 'stage' not in {row[1] for row in db.execute('PRAGMA table_info(reset_event_receipts)')}:
@@ -185,6 +188,9 @@ class EventLedger:
             self.db.execute('UPDATE reset_event_messages SET event_id=? WHERE event_id=?',(keep,other))
             self.db.execute('UPDATE reset_event_receipts SET event_id=? WHERE event_id=?',(keep,other))
             self.db.execute('UPDATE reset_event_plan_changes SET event_id=? WHERE event_id=?',(keep,other))
+            self.db.execute('''INSERT OR IGNORE INTO reset_event_suppressions
+                SELECT ?,stage,reason,created_at FROM reset_event_suppressions WHERE event_id=?''',(keep,other))
+            self.db.execute('DELETE FROM reset_event_suppressions WHERE event_id=?',(other,))
             self.db.execute('DELETE FROM reset_event_aliases WHERE event_id=?',(other,))
             self.db.execute('DELETE FROM reset_events WHERE id=?',(other,))
         return keep
@@ -299,6 +305,9 @@ class EventLedger:
         row = self._message(origin,ident,version)
         if row is None:
             return None
+        if self.db.execute('SELECT 1 FROM reset_event_suppressions WHERE event_id=? AND stage=?',
+                           (row['event_id'],row['stage'])).fetchone():
+            return None
         receipts = self.db.execute('SELECT * FROM reset_event_receipts WHERE event_id=? ORDER BY id',(row['event_id'],)).fetchall()
         if any(r['origin']==row['origin'] and r['ident']==row['ident'] and r['message_revision']==row['revision'] for r in receipts):
             return None
@@ -328,6 +337,13 @@ class EventLedger:
             return None
         revision = 'unconfirmed:'+row['body_hash']
         return None if any(r['revision']==revision for r in receipts) else 'unconfirmed'
+
+    def suppress(self, event_id, stage, reason, created_at):
+        """Explicit operator choice; never manufacture a successful delivery."""
+        if stage not in ('announced','reported_complete') or not reason or not self._event(event_id):
+            raise ValueError('invalid_event_suppression')
+        self.db.execute('INSERT OR REPLACE INTO reset_event_suppressions VALUES(?,?,?,?)',
+                        (event_id,stage,reason,created_at))
 
     def delivered(self, origin, ident, version):
         notice = self.notice(origin,ident,version)

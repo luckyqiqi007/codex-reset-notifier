@@ -230,6 +230,21 @@ class StatusTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(self.classify(text), "announced")
 
+    def test_gradual_completion_is_recognized_under_old_announcement_heading(self):
+        text='''🎁 Day 23：重置将于美西时间今日结束前生效
+（14:30重置已陆续完成）
+🎁 Day 23: Rest and Reset Landing by Midnight PST
+• Limit Reset: Finished'''
+        self.assertEqual(self.classify(text),'reported_complete')
+        for text in ['重置已逐步完成。','重置已经全部完成。','Limit Reset: Finished','Quota Reset: Completed']:
+            with self.subTest(text=text):self.assertEqual(self.classify(text),'reported_complete')
+
+    def test_completion_variants_still_require_explicit_non_future_evidence(self):
+        for text in ['Done','Finished','has landed','重置尚未完成。','重置尚未陆续完成。',
+                     '重置已陆续完成？','如果重置已陆续完成，请尝试。','预计明天重置已全部完成。',
+                     'Limit Reset: Not Finished','Limit Reset: Finished testing the parser']:
+            with self.subTest(text=text):self.assertNotEqual(self.classify(text),'reported_complete')
+
 
 if __name__ == "__main__":
     unittest.main()
