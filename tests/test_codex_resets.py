@@ -148,7 +148,7 @@ class SupplementTests(unittest.TestCase):
                 row={'id':2,'date':stamp(NOW-30),'text':'又要重置了，具体时间未公布','links':['https://x.com/thsottiaux/status/123']}
                 store.observe([baseline,row],NOW,True)
                 self.assertEqual(store.pending(NOW),[])
-                row['text']='又要重置了，预计15:00完成'
+                row['text']='又要重置了，预计北京时间15:00完成'
                 store.observe([row],NOW,True)
                 self.assertEqual(len(store.pending(NOW)),1)
                 store.delivered(2,store.pending(NOW)[0]['hash'])

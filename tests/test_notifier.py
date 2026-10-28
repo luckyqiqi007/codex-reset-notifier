@@ -79,7 +79,7 @@ class NotifierTests(unittest.TestCase):
         db.observe([post()], self.now, enabled=True)
         db.observe([post(text="重置预告更正：明天到账")], self.now, enabled=True)
         item = db.pending(self.now)[0]
-        self.assertIn("内容更新", json.loads(item["payload"])["markdown"]["content"])
+        self.assertIn("更正说明", json.loads(item["payload"])["markdown"]["content"])
         db.delivered(101, item["hash"])
         db.observe([post(text="重置预告更正：明天到账")], self.now, enabled=True)
         self.assertEqual(db.pending(self.now), [])

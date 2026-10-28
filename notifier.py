@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import codex_resets
+from reset_events import EventLedger
 from pathlib import Path
 import re
 import signal
@@ -173,6 +174,38 @@ class Store:
             codex_resets.init_ledger(self.db)
             for item in self.db.execute("SELECT * FROM posts WHERE state='sent'"):
                 codex_resets.record_receipts(self.db, codex_resets.telegram_keys(previous_row(dict(item)) or {}), "telegram")
+        self.events = EventLedger(self.db)
+        with self.db:
+            records = self.db.execute('SELECT * FROM posts ORDER BY published,id').fetchall()
+            for item in records:
+                row = previous_row(dict(item))
+                if row:
+                    self.remember_event(row, item['hash'])
+            for item in records:
+                if item['state'] == 'sent' and previous_row(dict(item)):
+                    self.events.delivered('telegram', str(item['id']), item['hash'])
+
+    def remember_event(self, row, digest):
+        stage = classify_status(row['text'])
+        kind = codex_resets.reset_kind(row['text'])
+        prior_links = []
+        if stage == 'correction':
+            old = self.db.execute('SELECT * FROM posts WHERE id=?',(row['id'],)).fetchone()
+            prior_links = (previous_row(dict(old)) or {}).get('links',[]) if old else []
+            event = self.db.execute("SELECT e.id,e.kind FROM reset_events e JOIN reset_event_messages m ON e.id=m.event_id WHERE m.origin='telegram' AND m.ident=?",(str(row['id']),)).fetchone()
+            if event:
+                kind = event['kind']
+                prior_links += ['https://x.com/i/web/status/'+a[0] for a in self.db.execute("SELECT value FROM reset_event_aliases WHERE event_id=? AND alias_type='x'",(event['id'],))]
+        self.events.remember('telegram', str(row['id']), digest, text=row['text'],
+                             published=message_time(row).timestamp(), stage=stage,
+                             kind=kind, links=row.get('links', []))
+        if stage == 'correction':
+            self.db.execute("DELETE FROM reset_event_receipts WHERE origin='telegram' AND ident=? AND stage='reported_complete'",(str(row['id']),))
+            for link in row.get('links', []) + prior_links:
+                ident = codex_resets.x_id(link)
+                if ident:
+                    key = 'x:'+ident+':'+kind+':reported_complete'
+                    self.db.execute("DELETE FROM source_receipts WHERE origin='telegram' AND event_key=?",(key,))
 
     def close(self):
         self.db.close()
@@ -192,6 +225,7 @@ class Store:
             for row in rows:
                 published = message_time(row).timestamp()
                 digest = raw_fingerprint(row)
+                self.remember_event(row, digest)
                 meaning = fingerprint(row, self.channel)
                 snapshot = json.dumps(row, ensure_ascii=False, sort_keys=True)
                 old = self.db.execute("SELECT * FROM posts WHERE id=?", (row["id"],)).fetchone()
@@ -232,12 +266,29 @@ class Store:
         result = []
         with self.db:
             for row in self.db.execute("SELECT * FROM posts WHERE state='pending' AND next_retry<=? ORDER BY id LIMIT 5", (now,)).fetchall():
-                keys = codex_resets.telegram_keys(previous_row(dict(row)) or {})
-                if not row['source_update'] and codex_resets.seen_elsewhere(self.db, keys, 'telegram'):
-                    self.db.execute("UPDATE posts SET state='deduped',ever_sent=1 WHERE id=?", (row['id'],))
-                else:
-                    result.append(dict(row))
+                item = dict(row)
+                content = self.prepare_delivery(item)
+                if content is not None:
+                    item['payload'] = content
+                    result.append(item)
         return result
+
+    def prepare_delivery(self, item):
+        """Recheck immediately before sending, including within one batch."""
+        with self.db:
+            row = self.db.execute("SELECT * FROM posts WHERE id=? AND hash=? AND state='pending'", (item['id'], item['hash'])).fetchone()
+            if row is None:
+                return None
+            notice = self.events.notice('telegram', str(row['id']), row['hash'])
+            keys = codex_resets.telegram_keys(previous_row(dict(row)) or {})
+            legacy_duplicate = (notice not in ('time_change', 'correction') and not row['source_update']
+                                and codex_resets.seen_elsewhere(self.db, keys, 'telegram'))
+            if notice is None or legacy_duplicate:
+                self.db.execute("UPDATE posts SET state='deduped',ever_sent=1 WHERE id=? AND hash=?", (row['id'], row['hash']))
+                return None
+            content = codex_resets.event_payload(row['payload'], notice)
+            self.db.execute('UPDATE posts SET payload=? WHERE id=? AND hash=?', (content,row['id'],row['hash']))
+            return content
 
     def delivered(self, msg_id, digest):
         with self.db:
@@ -245,6 +296,7 @@ class Store:
             row = self.db.execute("SELECT * FROM posts WHERE id=? AND hash=?", (msg_id, digest)).fetchone()
             if row:
                 codex_resets.record_receipts(self.db, codex_resets.telegram_keys(previous_row(dict(row)) or {}), 'telegram')
+                self.events.delivered('telegram', str(msg_id), digest)
 
     def failed(self, msg_id, now, max_attempts=8):
         row = self.db.execute("SELECT attempts FROM posts WHERE id=?", (msg_id,)).fetchone()
@@ -350,23 +402,17 @@ def delivery_status(stores):
 
 
 def deliver_pending(stores, destinations, clock=None, heartbeat=lambda: None,
-                    pause=lambda seconds: None, stopped=lambda: False):
+                    pause=lambda seconds: None, stopped=lambda: False, websites=None):
     clock = time.time if clock is None else clock
     for name, destination in destinations.items():
-        store = stores[name]
-        for item in store.pending(clock()):
-            if stopped():
-                return
-            heartbeat()
-            try:
-                destination.send(item["payload"])
-                store.delivered(item["id"], item["hash"])
-                LOG.info("delivery_ok destination=%s message_id=%d", name, item["id"])
-            except DeliveryError as exc:
-                store.failed(item["id"], clock())
-                LOG.warning("delivery_failed destination=%s message_id=%d reason=%s", name, item["id"], exc)
-            heartbeat()
-            pause(3.5)
+        if stopped():
+            return
+        results = codex_resets.deliver_events(stores[name],(websites or {}).get(name),destination.send,
+                                             clock=clock,pause=pause,stopped=stopped,heartbeat=heartbeat)
+        for origin,counts in results.items():
+            if counts['sent'] or counts['failed']:
+                LOG.info("event_delivery destination=%s source=%s sent=%d failed=%d",
+                         name,origin,counts['sent'],counts['failed'])
 
 
 def fetch_since(transport, channel, cursor, now=None):
@@ -541,12 +587,8 @@ def main():
             for name, error in errors.items():
                 LOG.warning("source_failed destination=%s reason=%s", name, error)
             if enabled:
-                deliver_pending(stores, destinations, heartbeat=heartbeat, pause=STOP.wait, stopped=STOP.is_set)
-                for name, site in websites.items():
-                    counts = codex_resets.deliver(site, destinations[name].send, time.time(), STOP.wait, STOP.is_set)
-                    if counts["sent"] or counts["failed"]:
-                        LOG.info("codex_resets_delivery destination=%s sent=%d failed=%d", name, counts["sent"], counts["failed"])
-                    heartbeat()
+                deliver_pending(stores, destinations, heartbeat=heartbeat, pause=STOP.wait,
+                                stopped=STOP.is_set, websites=websites)
             for store in stores.values():
                 store.expire(time.time())
             heartbeat()

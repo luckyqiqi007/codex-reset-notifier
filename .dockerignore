@@ -6,3 +6,4 @@
 !Dockerfile
 !.dockerignore
 !codex_resets.py
+!reset_events.py

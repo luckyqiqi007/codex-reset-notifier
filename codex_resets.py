@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 from urllib.request import build_opener, ProxyHandler, HTTPRedirectHandler, Request
 
 from message_content import classify_status
+from reset_events import EventLedger
 
 API_URL = 'https://codex-resets.com/api/v1/status'
 MAX_AGE = 48 * 3600
@@ -41,12 +42,16 @@ def x_id(url):
         return None
 
 
+def reset_kind(text):
+    return 'banked' if re.search(r'banked|重置卡|备用重置', text, re.I) else 'regular'
+
+
 def telegram_keys(row):
     text = row.get('text', '')
     stage = classify_status(text)
     if stage not in ('announced', 'reported_complete'):
         return []
-    kind = 'banked' if re.search(r'banked|重置卡|备用重置', text, re.I) else 'regular'
+    kind = reset_kind(text)
     return [f'x:{ident}:{kind}:{stage}' for url in row.get('links', []) if (ident := x_id(url))]
 
 
@@ -123,8 +128,12 @@ def parse_status(document, now=None):
                 timestamp(scheduled)
             key = f'x:{x_id(url)}:{kind}:{stage}' if x_id(url) else f'observed:{ident}:{kind}:{stage}'
             storage_id = ident + ':' + stage
-            if stage == 'reported_complete' and not completion_supported(text):
-                stage = 'unconfirmed'
+            if stage == 'reported_complete':
+                if classify_status(text) == 'correction':
+                    stage = 'correction'
+                    key = key.rsplit(':',1)[0]+':correction'
+                elif not completion_supported(text):
+                    stage = 'unconfirmed'
             # Keep the source slot's identity when evidence is downgraded, so
             # an edit invalidates its existing pending completion and receipt.
             result.append(dict(id=storage_id, stage=stage, reset_type=kind, text=text,
@@ -161,7 +170,7 @@ def payload(event, now):
     def local(value):
         return datetime.fromtimestamp(value, timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
     label = {'announced': '重置预告', 'reported_complete': '网站称已完成',
-             'unconfirmed': '状态未确认'}[event['stage']]
+             'unconfirmed': '状态未确认', 'correction': '更正说明'}[event['stage']]
     kind = '重置卡' if event['reset_type'] == 'banked' else '常规重置'
     content = (f'**Codex 额度通知｜{label}（{kind}）**\n'
                f'公告/观测时间：{local(event["published"])}（北京时间）\n'
@@ -179,6 +188,16 @@ def payload(event, now):
     return json.dumps({'msgtype': 'markdown', 'markdown': {'content': content}}, ensure_ascii=False)
 
 
+def event_payload(raw, notice):
+    if notice not in ('time_change', 'correction'):
+        return raw
+    document = json.loads(raw)
+    title = '时间变更' if notice == 'time_change' else '更正说明'
+    content = document['markdown']['content']
+    document['markdown']['content'] = re.sub(r'^\*\*[^\n]*\*\*', '**Codex 额度通知｜' + title + '**', content, count=1)
+    return json.dumps(document, ensure_ascii=False)
+
+
 class Supplement:
     def __init__(self, db):
         self.db = db
@@ -193,7 +212,11 @@ class Supplement:
         ''')
         if 'source_text' not in {row[1] for row in db.execute('PRAGMA table_info(website_events)')}:
             db.execute('ALTER TABLE website_events ADD COLUMN source_text TEXT')
+        if 'event_snapshot' not in {row[1] for row in db.execute('PRAGMA table_info(website_events)')}:
+            db.execute('ALTER TABLE website_events ADD COLUMN event_snapshot TEXT')
         with db:
+            for row in db.execute("SELECT * FROM website_events WHERE stage IN ('unconfirmed','correction') AND id LIKE '%:reported_complete'").fetchall():
+                self.invalidate_completion_receipts(row)
             for row in db.execute("SELECT * FROM website_events WHERE stage='reported_complete'").fetchall():
                 if row['source_text'] is None:
                     # Old payloads may be truncated. Never retry them as proof
@@ -202,10 +225,50 @@ class Supplement:
                 evidence = row['source_text'] if row['source_text'] is not None else legacy_body(row['payload'])
                 if not completion_supported(evidence):
                     self.reject_completion(row)
+        self.events = EventLedger(db)
+        with db:
+            records = db.execute('SELECT * FROM website_events ORDER BY published,id').fetchall()
+            for row in records:
+                event = self.previous_event(row)
+                if event:
+                    self.remember_event(event, row['digest'])
+            for row in records:
+                event = self.previous_event(row)
+                if row['state'] == 'sent' and event and (event['stage'] in ('announced','correction') or completion_supported(event['text'])):
+                    self.events.delivered('codex_resets', row['id'], row['digest'])
+
+    def previous_event(self, row):
+        try:
+            if row['event_snapshot']:
+                snapshot = json.loads(row['event_snapshot'])
+                if hashlib.sha256(json.dumps(snapshot,sort_keys=True).encode()).hexdigest() == row['digest']:
+                    return snapshot
+            content = json.loads(row['payload'])['markdown']['content']
+            text = row['source_text'] if row['source_text'] is not None else legacy_body(row['payload'])
+            if not text or '…详见原帖' in text:
+                return None
+            schedule = re.search(r'来源计划时间：(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})',content)
+            url = re.search(r'\[关联 X 原帖\]\(([^)]+)\)',content)
+            return dict(id=row['id'],stage=row['stage'],reset_type=row['event_key'].split(':')[-2],text=text,
+                        published=row['published'],scheduled_for=schedule[1].replace(' ','T')+'+08:00' if schedule else None,
+                        source_url=url[1] if url else '',event_key=row['event_key'])
+        except (ValueError,TypeError,KeyError,IndexError):
+            return None
+
+    def remember_event(self, event, digest):
+        self.events.remember('codex_resets', event['id'], digest, text=event['text'],published=event['published'],
+                             stage=event['stage'],kind=event['reset_type'],links=[event['source_url']] if event['source_url'] else [],
+                             scheduled_for=event.get('scheduled_for'))
 
     def reject_completion(self, row):
         self.db.execute("UPDATE website_events SET state='rejected' WHERE id=? AND state IN ('pending','dead','unverified')", (row['id'],))
-        self.db.execute("DELETE FROM source_receipts WHERE event_key=? AND origin='codex_resets'", (row['event_key'],))
+        self.invalidate_completion_receipts(row)
+
+    def invalidate_completion_receipts(self, row):
+        key = row['event_key'].rsplit(':',1)[0]+':reported_complete'
+        self.db.execute("DELETE FROM source_receipts WHERE event_key=? AND origin='codex_resets'", (key,))
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='reset_event_receipts'").fetchone():
+            self.db.execute("DELETE FROM reset_event_receipts WHERE origin='codex_resets' AND ident=? AND stage='reported_complete'",(row['id'],))
 
     def observe(self, events, now, enabled):
         initialized = self.db.execute("SELECT 1 FROM source_meta WHERE key='codex_resets_initialized'").fetchone()
@@ -213,8 +276,15 @@ class Supplement:
             for event in events:
                 digest = hashlib.sha256(json.dumps(event, sort_keys=True).encode()).hexdigest()
                 old = self.db.execute('SELECT * FROM website_events WHERE id=?', (event['id'],)).fetchone()
-                supported = event['stage'] == 'announced' or (event['stage'] == 'reported_complete' and completion_supported(event['text']))
+                self.remember_event(event, digest)
+                supported = event['stage'] in ('announced','correction') or (event['stage'] == 'reported_complete' and completion_supported(event['text']))
                 if old and old['digest'] == digest:
+                    if not supported:
+                        self.reject_completion(event)
+                    elif event['stage'] == 'correction':
+                        self.invalidate_completion_receipts(event)
+                    self.db.execute('UPDATE website_events SET event_snapshot=? WHERE id=?',
+                                    (json.dumps(event,ensure_ascii=False,sort_keys=True),event['id']))
                     if old['source_text'] is None and supported:
                         state = ('dead' if old['attempts'] >= 8 else 'pending') if old['state'] == 'unverified' else old['state']
                         self.db.execute('UPDATE website_events SET source_text=?,state=? WHERE id=?',
@@ -222,15 +292,17 @@ class Supplement:
                     continue
                 eligible = initialized and enabled and supported and 0 <= now - event['published'] <= MAX_AGE
                 state = ('pending' if eligible else 'ignored') if supported else 'rejected'
-                self.db.execute('''INSERT INTO website_events(id,digest,payload,event_key,stage,published,state,source_text)
-                    VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET digest=excluded.digest,
+                self.db.execute('''INSERT INTO website_events(id,digest,payload,event_key,stage,published,state,source_text,event_snapshot)
+                    VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET digest=excluded.digest,
                     payload=excluded.payload,event_key=excluded.event_key,published=excluded.published,
-                    state=excluded.state,stage=excluded.stage,source_text=excluded.source_text,
+                    state=excluded.state,stage=excluded.stage,source_text=excluded.source_text,event_snapshot=excluded.event_snapshot,
                     attempts=0,next_retry=0,source_update=1''',
                     (event['id'], digest, payload(event, now), event['event_key'], event['stage'],
-                     event['published'], state, event['text']))
+                     event['published'], state, event['text'], json.dumps(event,ensure_ascii=False,sort_keys=True)))
                 if not supported:
                     self.reject_completion(event)
+                elif event['stage'] == 'correction':
+                    self.invalidate_completion_receipts(event)
             self.db.execute("INSERT OR IGNORE INTO source_meta VALUES('codex_resets_initialized','1')")
 
     def pending(self, now):
@@ -239,20 +311,40 @@ class Supplement:
             self.db.execute("UPDATE website_events SET state='expired' WHERE state IN ('pending','dead') AND published<?", (now-MAX_AGE,))
             rows = self.db.execute("SELECT * FROM website_events WHERE state='pending' AND next_retry<=? ORDER BY published,id LIMIT 5", (now,)).fetchall()
             for row in rows:
-                if row['stage'] != 'announced' and (row['stage'] != 'reported_complete' or not completion_supported(row['source_text'])):
+                if row['stage'] not in ('announced','correction') and (row['stage'] != 'reported_complete' or not completion_supported(row['source_text'])):
                     self.reject_completion(row)
                     continue
-                if not row['ever_sent'] and not row['source_update'] and seen_elsewhere(self.db, [row['event_key']], 'codex_resets'):
-                    self.db.execute("UPDATE website_events SET state='deduped',ever_sent=1 WHERE id=?", (row['id'],))
-                else:
-                    result.append(dict(row))
+                item = dict(row)
+                content = self.prepare_delivery(item)
+                if content is not None:
+                    item['payload'] = content
+                    result.append(item)
         return result
+
+    def prepare_delivery(self, item):
+        with self.db:
+            row = self.db.execute("SELECT * FROM website_events WHERE id=? AND digest=? AND state='pending'", (item['id'],item['digest'])).fetchone()
+            if row is None:
+                return None
+            if row['stage'] not in ('announced','correction') and (row['stage'] != 'reported_complete' or not completion_supported(row['source_text'])):
+                self.reject_completion(row)
+                return None
+            notice = self.events.notice('codex_resets',row['id'],row['digest'])
+            legacy_duplicate = (notice not in ('time_change','correction') and not row['ever_sent'] and not row['source_update']
+                                and seen_elsewhere(self.db,[row['event_key']],'codex_resets'))
+            if notice is None or legacy_duplicate:
+                self.db.execute("UPDATE website_events SET state='deduped',ever_sent=1 WHERE id=? AND digest=?",(row['id'],row['digest']))
+                return None
+            content = event_payload(row['payload'],notice)
+            self.db.execute('UPDATE website_events SET payload=? WHERE id=? AND digest=?',(content,row['id'],row['digest']))
+            return content
 
     def delivered(self, item):
         with self.db:
             changed = self.db.execute("UPDATE website_events SET state='sent',ever_sent=1 WHERE id=? AND digest=?", (item['id'],item['digest'])).rowcount
             if changed:
                 record_receipts(self.db, [item['event_key']], 'codex_resets')
+                self.events.delivered('codex_resets',item['id'],item['digest'])
 
     def failed(self, item, now):
         attempts = item['attempts'] + 1
@@ -292,13 +384,50 @@ def deliver(supplement, send, now, pause=lambda _: None, stopped=lambda: False):
     for item in supplement.pending(now):
         if stopped():
             break
+        content = supplement.prepare_delivery(item)
+        if content is None:
+            continue
         try:
-            send(item['payload'])
+            send(content)
         except Exception:
             supplement.failed(item, now)
             counts['failed'] += 1
         else:
             supplement.delivered(item)
             counts['sent'] += 1
+        pause(3.5)
+    return counts
+
+
+def deliver_events(store, supplement, send, clock=time.time, pause=lambda _: None,
+                   stopped=lambda: False, heartbeat=lambda: None):
+    """First available source wins; same-cycle candidates use publication order."""
+    counts = {origin: {'sent': 0, 'failed': 0} for origin in ('telegram','codex_resets')}
+    candidates = [('telegram',item) for item in store.pending(clock())]
+    if supplement:
+        candidates.extend(('codex_resets',item) for item in supplement.pending(clock()))
+    for origin,item in sorted(candidates,key=lambda pair:(pair[1]['published'],pair[0],str(pair[1]['id']))):
+        if stopped():
+            break
+        queue = store if origin == 'telegram' else supplement
+        content = queue.prepare_delivery(item)
+        if content is None:
+            continue
+        heartbeat()
+        try:
+            send(content)
+        except Exception:
+            if origin == 'telegram':
+                store.failed(item['id'],clock())
+            else:
+                supplement.failed(item,clock())
+            counts[origin]['failed'] += 1
+        else:
+            if origin == 'telegram':
+                store.delivered(item['id'],item['hash'])
+            else:
+                supplement.delivered(item)
+            counts[origin]['sent'] += 1
+        heartbeat()
         pause(3.5)
     return counts

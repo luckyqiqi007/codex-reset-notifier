@@ -109,11 +109,11 @@ class MessageUpdateTests(unittest.TestCase):
         store.observe([row("Quota reset eligibility: Plus ❌ / Pro ✅")], self.now + 1, True)
         self.assertEqual(len(store.pending(self.now + 1)), 1)
 
-    def test_changed_source_link_is_substantive(self):
+    def test_new_link_for_same_day_event_does_not_repeat_announcement(self):
         store = self.store(); self.baseline(store)
         store.observe([row()], self.now, True); self.consume(store)
         store.observe([row(links=["https://x.com/thsottiaux/status/2114588174249071103"])], self.now + 1, True)
-        self.assertEqual(len(store.pending(self.now + 1)), 1)
+        self.assertEqual(store.pending(self.now + 1), [])
 
     def test_retraction_without_keyword_is_still_delivered(self):
         store = self.store(); self.baseline(store)
@@ -141,11 +141,11 @@ class MessageUpdateTests(unittest.TestCase):
         self.assertNotIn("Follow @codexreset", content)
         self.assertLessEqual(len(content.encode()), 4000)
 
-    def test_different_post_id_is_not_merged_by_similarity(self):
+    def test_different_post_id_with_same_day_and_link_is_same_event(self):
         store = self.store(); self.baseline(store)
         store.observe([row()], self.now, True); self.consume(store)
         store.observe([row(REWORDING, number=67)], self.now + 1, True)
-        self.assertEqual([x["id"] for x in store.pending(self.now + 1)], [67])
+        self.assertEqual(store.pending(self.now + 1), [])
 
     def legacy_payload(self, item):
         content = ("**Codex 额度通知｜频道转发**\n原帖发布时间：2026-10-26 13:42（北京时间）\n\n"
