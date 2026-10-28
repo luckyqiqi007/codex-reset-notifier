@@ -15,7 +15,7 @@ NOW = 1793156400
 def stamp(seconds=NOW):
     return datetime.fromtimestamp(seconds, timezone.utc).isoformat()
 def event(ident='123', **changes):
-    obj = dict(id=ident, reset_type='regular', announced_at=stamp(NOW-60), text='Lands by midnight PST.',
+    obj = dict(id=ident, reset_type='regular', announced_at=stamp(NOW-60), text='Codex usage limits have been reset.',
                source=dict(type='x_post', author='thsottiaux', url='https://x.com/thsottiaux/status/'+ident))
     obj.update(changes)
     return obj
@@ -48,11 +48,11 @@ class SupplementTests(unittest.TestCase):
         self.observe(document())
         self.observe(document(scheduled=event(status='scheduled', scheduled_for=stamp(NOW+3600))))
         first=self.store.pending(NOW)[0]; self.store.delivered(first)
-        self.observe(document(latest=event(text='Done')))
+        self.observe(document(latest=event()))
         second=self.store.pending(NOW)[0]
         self.assertEqual(second['stage'],'reported_complete')
         self.store.delivered(second)
-        self.observe(document(latest=event(text='Done')))
+        self.observe(document(latest=event()))
         self.assertEqual(self.store.pending(NOW),[])
     def test_telegram_receipt_suppresses_same_stage_but_not_completion(self):
         self.observe(document())
@@ -177,8 +177,93 @@ class SupplementTests(unittest.TestCase):
             store=notifier.Store(path)
             try:
                 site=cr.Supplement(store.db);site.observe([],NOW,True)
-                site.observe(cr.parse_status(document(latest=event(text='Done')),NOW),NOW,True)
+                site.observe(cr.parse_status(document(latest=event()),NOW),NOW,True)
                 self.assertEqual(len(site.pending(NOW)),1)
             finally:store.close()
+
+    def test_ambiguous_latest_never_sends_but_schedule_survives(self):
+        self.observe(document())
+        self.observe(document(latest=event('2115297093879472332', text='https://t.co/Fgy0dBAHsJ has landed'),
+                              scheduled=event(status='scheduled', scheduled_for=stamp(NOW+3600),
+                                              text='Lands by midnight PST.')))
+        pending=self.store.pending(NOW)
+        self.assertEqual([r['stage'] for r in pending], ['announced'])
+        weak=self.db.execute("SELECT * FROM website_events WHERE id='2115297093879472332:reported_complete'").fetchone()
+        self.assertEqual(weak['state'], 'rejected')
+        self.assertNotIn('网站称已完成',weak['payload'])
+
+    def test_completion_requires_explicit_unambiguous_reset_evidence(self):
+        weak=['Done', 'https://t.co/Fgy0dBAHsJ has landed', 'Reset has not happened.',
+              'If quotas are now live, enjoy.', 'Are quotas now live?',
+              'Quotas will have been reset tomorrow.', 'https://example.com/reset It is all propagated.',
+              'Today is a reset. The iCloud feature is fully propagated.',
+              'Codex limits have not yet been reset.', 'My password has been reset.',
+              'The demo database has been reset.', 'I have reset the counter.']
+        for text in weak:
+            with self.subTest(text=text):
+                events=cr.parse_status(document(latest=event(text=text)),NOW)
+                self.assertEqual(events[0]['stage'],'unconfirmed')
+        for text in ['Codex usage limits have been reset.', 'Fresh quotas are now live.', '额度已经重置。']:
+            with self.subTest(text=text):
+                self.assertEqual(cr.parse_status(document(latest=event(text=text)),NOW)[0]['stage'],'reported_complete')
+
+    def test_weak_edit_cancels_retry_and_later_completion_sends_once(self):
+        self.observe(document()); self.observe(document(latest=event()))
+        old=self.store.pending(NOW)[0];self.store.failed(old,NOW)
+        self.observe(document(latest=event(text='Done')))
+        self.assertEqual(self.store.pending(NOW+60),[])
+        self.observe(document(latest=event()))
+        self.assertEqual(cr.deliver(self.store,lambda _:None,NOW),{'sent':1,'failed':0})
+        self.assertEqual(self.store.pending(NOW),[])
+
+    def test_observed_source_has_same_evidence_gate(self):
+        self.observe(document())
+        self.observe(document(latest=event('observed-123',text='Done',source={'type':'observed'})))
+        self.assertEqual(self.store.pending(NOW),[])
+
+    def test_pending_rechecks_source_text_even_when_feed_unavailable(self):
+        self.observe(document());self.observe(document(latest=event()))
+        self.db.execute("UPDATE website_events SET source_text='Done'")
+        self.assertEqual(cr.deliver(self.store,lambda _:self.fail('must not send'),NOW),{'sent':0,'failed':0})
+
+    def test_legacy_completion_without_full_evidence_is_quarantined_on_restart(self):
+        self.observe(document());self.observe(document(latest=event()))
+        self.db.execute("UPDATE website_events SET source_text=NULL")
+        reopened=cr.Supplement(self.db)
+        self.assertEqual(reopened.pending(NOW),[])
+        self.assertEqual(self.db.execute('SELECT state FROM website_events').fetchone()[0],'unverified')
+
+    def test_fresh_full_evidence_restores_legacy_retry_without_resetting_backoff(self):
+        self.observe(document());self.observe(document(latest=event()))
+        self.store.failed(self.store.pending(NOW)[0],NOW)
+        self.db.execute('UPDATE website_events SET source_text=NULL')
+        self.store=cr.Supplement(self.db)
+        self.assertEqual(self.store.pending(NOW+60),[])
+        self.observe(document(latest=event()))
+        self.assertEqual(self.store.pending(NOW),[])
+        item=self.store.pending(NOW+30)[0]
+        self.assertEqual(item['attempts'],1)
+        self.assertEqual(item['next_retry'],NOW+30)
+
+    def test_invalid_legacy_receipt_removed_but_sent_audit_and_other_receipts_kept(self):
+        self.observe(document());self.observe(document(latest=event()))
+        old=self.store.pending(NOW)[0];self.store.delivered(old)
+        body=json.loads(old['payload'])
+        body['markdown']['content']=body['markdown']['content'].replace('Codex usage limits have been reset.','https://t.co/Fgy0dBAHsJ has landed')
+        self.db.execute('UPDATE website_events SET source_text=NULL,payload=?',(json.dumps(body),))
+        cr.record_receipts(self.db,['x:456:regular:reported_complete'],'codex_resets')
+        cr.record_receipts(self.db,[old['event_key']],'telegram')
+        cr.Supplement(self.db)
+        self.assertFalse(cr.seen_elsewhere(self.db,[old['event_key']],'telegram'))
+        self.assertTrue(cr.seen_elsewhere(self.db,[old['event_key']],'codex_resets'))
+        self.assertTrue(cr.seen_elsewhere(self.db,['x:456:regular:reported_complete'],'telegram'))
+        self.assertEqual(self.db.execute('SELECT state FROM website_events').fetchone()[0],'sent')
+
+    def test_unconfirmed_edit_removes_only_invalid_receipt(self):
+        self.observe(document());self.observe(document(latest=event()))
+        self.store.delivered(self.store.pending(NOW)[0])
+        self.observe(document(latest=event(text='Done')))
+        self.assertFalse(cr.seen_elsewhere(self.db,['x:123:regular:reported_complete'],'telegram'))
+        self.assertEqual(self.store.pending(NOW),[])
 
 if __name__=='__main__': unittest.main()

@@ -12,6 +12,7 @@ from message_content import classify_status
 
 API_URL = 'https://codex-resets.com/api/v1/status'
 MAX_AGE = 48 * 3600
+QUOTA_CONTEXT = re.compile(r'额度|配额|用量|限额|\bquotas?\b|\b(?:usage|rate)\s+limits?\b|\bcodex\b[^\n.!。;；]{0,30}\blimits?\b', re.I)
 
 
 class FeedError(ValueError):
@@ -62,6 +63,28 @@ def seen_elsewhere(db, keys, origin):
     return any(db.execute('SELECT 1 FROM source_receipts WHERE event_key=? AND origin<>?', (key, origin)).fetchone() for key in keys)
 
 
+def completion_supported(text):
+    """A feed label or a link is not evidence that quotas have reset."""
+    if not isinstance(text, str):
+        return False
+    text = re.sub(r'https?://\S+', '', text)
+    # Reset context and completion must occur in the same clause. Do not join
+    # an unrelated feature's completion to a reset announcement elsewhere.
+    return classify_status(text) == 'reported_complete' and any(
+        QUOTA_CONTEXT.search(clause) and classify_status(clause) == 'reported_complete'
+        for clause in re.split(r'[\n。.!；;]', text))
+
+
+def legacy_body(raw):
+    """Recover only the body, never the completion headline, for receipt audit."""
+    try:
+        content = json.loads(raw)['markdown']['content']
+        body, separator, _ = content.split('\n\n', 1)[1].rpartition('\n\n[数据来源：Codex Resets](')
+        return body if separator else ''
+    except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+        return ''
+
+
 def parse_status(document, now=None):
     now = time.time() if now is None else now
     try:
@@ -99,7 +122,12 @@ def parse_status(document, now=None):
             if scheduled is not None:
                 timestamp(scheduled)
             key = f'x:{x_id(url)}:{kind}:{stage}' if x_id(url) else f'observed:{ident}:{kind}:{stage}'
-            result.append(dict(id=ident + ':' + stage, stage=stage, reset_type=kind, text=text,
+            storage_id = ident + ':' + stage
+            if stage == 'reported_complete' and not completion_supported(text):
+                stage = 'unconfirmed'
+            # Keep the source slot's identity when evidence is downgraded, so
+            # an edit invalidates its existing pending completion and receipt.
+            result.append(dict(id=storage_id, stage=stage, reset_type=kind, text=text,
                                published=published, scheduled_for=scheduled, source_type=source['type'],
                                source_url=url, event_key=key))
         return result  # active_watch is an AI forecast, never a reset notification.
@@ -132,7 +160,8 @@ def fetch_status():
 def payload(event, now):
     def local(value):
         return datetime.fromtimestamp(value, timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
-    label = '重置预告' if event['stage'] == 'announced' else '网站称已完成'
+    label = {'announced': '重置预告', 'reported_complete': '网站称已完成',
+             'unconfirmed': '状态未确认'}[event['stage']]
     kind = '重置卡' if event['reset_type'] == 'banked' else '常规重置'
     content = (f'**Codex 额度通知｜{label}（{kind}）**\n'
                f'公告/观测时间：{local(event["published"])}（北京时间）\n'
@@ -162,6 +191,21 @@ class Supplement:
                 published REAL, state TEXT, attempts INTEGER DEFAULT 0, next_retry REAL DEFAULT 0,
                 ever_sent INTEGER DEFAULT 0, source_update INTEGER NOT NULL DEFAULT 0);
         ''')
+        if 'source_text' not in {row[1] for row in db.execute('PRAGMA table_info(website_events)')}:
+            db.execute('ALTER TABLE website_events ADD COLUMN source_text TEXT')
+        with db:
+            for row in db.execute("SELECT * FROM website_events WHERE stage='reported_complete'").fetchall():
+                if row['source_text'] is None:
+                    # Old payloads may be truncated. Never retry them as proof
+                    # of completion; preserve previously sent payloads for audit.
+                    db.execute("UPDATE website_events SET state='unverified' WHERE id=? AND state IN ('pending','dead')", (row['id'],))
+                evidence = row['source_text'] if row['source_text'] is not None else legacy_body(row['payload'])
+                if not completion_supported(evidence):
+                    self.reject_completion(row)
+
+    def reject_completion(self, row):
+        self.db.execute("UPDATE website_events SET state='rejected' WHERE id=? AND state IN ('pending','dead','unverified')", (row['id'],))
+        self.db.execute("DELETE FROM source_receipts WHERE event_key=? AND origin='codex_resets'", (row['event_key'],))
 
     def observe(self, events, now, enabled):
         initialized = self.db.execute("SELECT 1 FROM source_meta WHERE key='codex_resets_initialized'").fetchone()
@@ -169,15 +213,24 @@ class Supplement:
             for event in events:
                 digest = hashlib.sha256(json.dumps(event, sort_keys=True).encode()).hexdigest()
                 old = self.db.execute('SELECT * FROM website_events WHERE id=?', (event['id'],)).fetchone()
+                supported = event['stage'] == 'announced' or (event['stage'] == 'reported_complete' and completion_supported(event['text']))
                 if old and old['digest'] == digest:
+                    if old['source_text'] is None and supported:
+                        state = ('dead' if old['attempts'] >= 8 else 'pending') if old['state'] == 'unverified' else old['state']
+                        self.db.execute('UPDATE website_events SET source_text=?,state=? WHERE id=?',
+                                        (event['text'],state,event['id']))
                     continue
-                eligible = initialized and enabled and 0 <= now - event['published'] <= MAX_AGE
-                self.db.execute('''INSERT INTO website_events(id,digest,payload,event_key,stage,published,state)
-                    VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET digest=excluded.digest,
+                eligible = initialized and enabled and supported and 0 <= now - event['published'] <= MAX_AGE
+                state = ('pending' if eligible else 'ignored') if supported else 'rejected'
+                self.db.execute('''INSERT INTO website_events(id,digest,payload,event_key,stage,published,state,source_text)
+                    VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET digest=excluded.digest,
                     payload=excluded.payload,event_key=excluded.event_key,published=excluded.published,
-                    state=excluded.state,attempts=0,next_retry=0,source_update=1''',
+                    state=excluded.state,stage=excluded.stage,source_text=excluded.source_text,
+                    attempts=0,next_retry=0,source_update=1''',
                     (event['id'], digest, payload(event, now), event['event_key'], event['stage'],
-                     event['published'], 'pending' if eligible else 'ignored'))
+                     event['published'], state, event['text']))
+                if not supported:
+                    self.reject_completion(event)
             self.db.execute("INSERT OR IGNORE INTO source_meta VALUES('codex_resets_initialized','1')")
 
     def pending(self, now):
@@ -186,6 +239,9 @@ class Supplement:
             self.db.execute("UPDATE website_events SET state='expired' WHERE state IN ('pending','dead') AND published<?", (now-MAX_AGE,))
             rows = self.db.execute("SELECT * FROM website_events WHERE state='pending' AND next_retry<=? ORDER BY published,id LIMIT 5", (now,)).fetchall()
             for row in rows:
+                if row['stage'] != 'announced' and (row['stage'] != 'reported_complete' or not completion_supported(row['source_text'])):
+                    self.reject_completion(row)
+                    continue
                 if not row['ever_sent'] and not row['source_update'] and seen_elsewhere(self.db, [row['event_key']], 'codex_resets'):
                     self.db.execute("UPDATE website_events SET state='deduped',ever_sent=1 WHERE id=?", (row['id'],))
                 else:

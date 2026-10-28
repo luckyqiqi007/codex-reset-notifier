@@ -26,7 +26,7 @@ Telegram 公开频道 ──直连 / HTTP CONNECT 代理 / 固定 HTTPS relay─
 
 ## 可选补充来源
 
-支持 Codex Resets 免费公开 API；设置 `CODEX_RESETS_ENABLED=true` 开启，默认关闭。仅通知明确预告和网站完成记录，不推送 AI 概率预测。首次接入只建基线，同一 X 帖同阶段跨来源去重，预告变完成及实质编辑仍提醒。详见 [来源评估和接入说明](docs/sources.md)。Docker Compose 启用方式：
+支持 Codex Resets 免费公开 API；设置 `CODEX_RESETS_ENABLED=true` 开启，默认关闭。仅通知明确预告和正文有明确额度完成证据的网站记录，不推送 AI 概率预测。网站分类或 `has landed` 等模糊回复不能作为完成依据。首次接入只建基线，同一 X 帖同阶段跨来源去重，预告变完成及实质编辑仍提醒。详见 [来源评估和接入说明](docs/sources.md)。Docker Compose 启用方式：
 
 ```sh
 CODEX_RESETS_ENABLED=true docker compose up -d
